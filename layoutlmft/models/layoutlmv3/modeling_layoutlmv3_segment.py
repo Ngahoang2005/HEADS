@@ -169,7 +169,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 f"{self.token_blend_max}"
             )
         self.token_blend_raw = nn.Parameter(
-            torch.tensor(-1.3863, dtype=torch.float32)
+            torch.tensor(-2.0, dtype=torch.float32)
         )
 
         # ------------------------------------------------------------------

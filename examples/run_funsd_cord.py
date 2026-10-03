@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
+
 import logging
 import os
 import sys
@@ -11,6 +12,7 @@ from datasets import ClassLabel, load_dataset, load_metric
 
 import transformers
 import torch
+
 from layoutlmft.data import DataCollatorForKeyValueExtraction
 from transformers import (
     AutoConfig,
@@ -25,239 +27,1051 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.5.0")
+from layoutlmft.data.image_utils import (
+    RandomResizedCropAndInterpolationWithTwoPic,
+    pil_loader,
+    Compose,
+)
 
-logger = logging.getLogger(__name__)
-from layoutlmft.data.image_utils import RandomResizedCropAndInterpolationWithTwoPic, pil_loader, Compose
-
-from timm.data.constants import \
-    IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+from timm.data.constants import (
+    IMAGENET_DEFAULT_MEAN,
+    IMAGENET_DEFAULT_STD,
+    IMAGENET_INCEPTION_MEAN,
+    IMAGENET_INCEPTION_STD,
+)
 from torchvision import transforms
-import torch
+
+
+check_min_version("4.5.0")
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# ARGUMENTS
+# ==============================================================================
 
 @dataclass
 class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
-    """
-
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
-        },
-    )
-    use_hierarchical_position_encoding: bool = field(
-        default=False,
-        metadata={"help": "Enable Hierarchical Position Encoding (HPE)"}
-    )
-    max_line_position: int = field(
-        default=50,
-        metadata={"help": "Maximum number of lines in a document for HPE"}
-    )
-    max_block_position: int = field(
-        default=20,
-        metadata={"help": "Maximum number of blocks in a document for HPE"}
-    )
-    use_column_encoding: bool = field(
-        default=False,
-        metadata={"help": "Enable Column Position Encoding"}
-    )
-    max_column_position: int = field(
-        default=10,
-        metadata={"help": "Maximum number of columns in a document"}
-    )
-    use_intra_line_boundary: bool = field(
-        default=False,
-        metadata={"help": "Enable Intra-Line Boundary Transition Parsing"}
-    )
-    lambda_bound_init: float = field(
-        default=0.1,
-        metadata={"help": "Initial weight for boundary loss"}
-    )
-    use_semantic_geometry_disentangle: bool = field(
-        default=False,
-        metadata={"help": "Enable Semantic-Geometry Disentanglement"}
-    )
-    lambda_geo_init: float = field(
-        default=0.1,
-        metadata={"help": "Initial weight for geometry loss"}
-    )
-    lambda_orth_init: float = field(
-        default=0.1,
-        metadata={"help": "Initial weight for orthogonality loss"}
-    )
+    config_name: Optional[str] = field(default=None)
+    tokenizer_name: Optional[str] = field(default=None)
+    cache_dir: Optional[str] = field(default=None)
+    model_revision: str = field(default="main")
+    use_auth_token: bool = field(default=False)
+
+    use_hierarchical_position_encoding: bool = field(default=False)
+    max_line_position: int = field(default=50)
+    max_block_position: int = field(default=20)
+    use_column_encoding: bool = field(default=False)
+    max_column_position: int = field(default=10)
+
+    use_intra_line_boundary: bool = field(default=False)
+    lambda_bound_init: float = field(default=0.1)
+
+    use_semantic_geometry_disentangle: bool = field(default=False)
+    lambda_geo_init: float = field(default=0.1)
+    lambda_orth_init: float = field(default=0.1)
 
 
 @dataclass
 class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
+    task_name: Optional[str] = field(default="ner")
+    dataset_name: Optional[str] = field(default="funsd")
+    dataset_config_name: Optional[str] = field(default=None)
 
-    task_name: Optional[str] = field(default="ner", metadata={"help": "The name of the task (ner, pos...)."})
-    dataset_name: Optional[str] = field(
-        default='funsd', metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_file: Optional[str] = field(
-        default=None, metadata={"help": "The input training data file (a csv or JSON file)."}
-    )
-    validation_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "An optional input evaluation data file to evaluate on (a csv or JSON file)."},
-    )
-    test_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "An optional input test data file to predict on (a csv or JSON file)."},
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    pad_to_max_length: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to pad all samples to model maximum sentence length. "
-            "If False, will pad the samples dynamically when batching to the maximum length in the batch. More "
-            "efficient on GPU but very bad for TPU."
-        },
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
-        },
-    )
-    max_val_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of validation examples to this "
-            "value if set."
-        },
-    )
-    max_test_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of test examples to this "
-            "value if set."
-        },
-    )
-    label_all_tokens: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to put the label for one word on all tokens of generated by that word or just on the "
-            "one (in which case the other tokens will have a padding index)."
-        },
-    )
-    return_entity_level_metrics: bool = field(
-        default=False,
-        metadata={"help": "Whether to return all the entity levels during evaluation or just the overall ones."},
-    )
+    train_file: Optional[str] = field(default=None)
+    validation_file: Optional[str] = field(default=None)
+    test_file: Optional[str] = field(default=None)
+
+    overwrite_cache: bool = field(default=False)
+    preprocessing_num_workers: Optional[int] = field(default=None)
+    pad_to_max_length: bool = field(default=True)
+
+    max_train_samples: Optional[int] = field(default=None)
+    max_val_samples: Optional[int] = field(default=None)
+    max_test_samples: Optional[int] = field(default=None)
+
+    label_all_tokens: bool = field(default=False)
+    return_entity_level_metrics: bool = field(default=False)
+
     segment_level_layout: bool = field(default=True)
     visual_embed: bool = field(default=True)
-    use_segment_head: bool = field(
-        default=False,
-        metadata={
-            "help": "Use LayoutLMv3ForSegmentTokenClassification (segment-level pooling + "
-            "inter-segment context head) instead of the vanilla per-token classification head."
-        },
-    )
-    data_dir: Optional[str] = field(default=None)
-    input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
-    second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
-    train_interpolation: str = field(
-        default='bicubic', metadata={"help": "Training interpolation (random, bilinear, bicubic)"})
-    second_interpolation: str = field(
-        default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
-    imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
+    use_segment_head: bool = field(default=False)
 
+    # Automatic geometry-only reading-order / segmentation.
+    # There is intentionally NO oracle-segment path in this file.
+    apply_xy_cut: bool = field(
+        default=True,
+        metadata={"help": "Build reading order from OCR bounding boxes using recursive XY-Cut."},
+    )
+
+    data_dir: Optional[str] = field(default=None)
+
+    input_size: int = field(default=224)
+    second_input_size: int = field(default=112)
+
+    train_interpolation: str = field(default="bicubic")
+    second_interpolation: str = field(default="lanczos")
+    imagenet_default_mean_and_std: bool = field(default=False)
+
+
+# ==============================================================================
+# GEOMETRIC PRIMITIVES
+# ==============================================================================
+
+def _height(box):
+    return max(1.0, float(box[3] - box[1]))
+
+
+def _width(box):
+    return max(1.0, float(box[2] - box[0]))
+
+
+def _x_center(box):
+    return 0.5 * (float(box[0]) + float(box[2]))
+
+
+def _y_center(box):
+    return 0.5 * (float(box[1]) + float(box[3]))
+
+
+def _horizontal_gap(box_a, box_b):
+    if float(box_a[2]) < float(box_b[0]):
+        return float(box_b[0]) - float(box_a[2])
+    if float(box_b[2]) < float(box_a[0]):
+        return float(box_a[0]) - float(box_b[2])
+    return 0.0
+
+
+def _vertical_gap(box_a, box_b):
+    if float(box_a[3]) < float(box_b[1]):
+        return float(box_b[1]) - float(box_a[3])
+    if float(box_b[3]) < float(box_a[1]):
+        return float(box_a[1]) - float(box_b[3])
+    return 0.0
+
+
+def _vertical_overlap_ratio(box_a, box_b):
+    top = max(float(box_a[1]), float(box_b[1]))
+    bottom = min(float(box_a[3]), float(box_b[3]))
+    inter = max(0.0, bottom - top)
+    denom = max(1.0, min(_height(box_a), _height(box_b)))
+    return inter / denom
+
+
+def _horizontal_overlap_ratio(box_a, box_b):
+    left = max(float(box_a[0]), float(box_b[0]))
+    right = min(float(box_a[2]), float(box_b[2]))
+    inter = max(0.0, right - left)
+    denom = max(1.0, min(_width(box_a), _width(box_b)))
+    return inter / denom
+
+
+# ==============================================================================
+# STEP 1: VISUAL LINE CONSTRUCTION
+# ==============================================================================
+
+def build_visual_lines(bboxes):
+    """
+    Build spatial text lines from OCR word boxes.
+
+    IMPORTANT:
+      - Uses only bounding boxes.
+      - Does not inspect labels.
+      - Does not use dataset-provided/oracle segments.
+
+    A line is formed from words that are vertically aligned and close enough
+    horizontally to plausibly belong to one visual text line.
+    """
+    n = len(bboxes)
+    if n == 0:
+        return []
+
+    heights = np.asarray([_height(b) for b in bboxes], dtype=np.float32)
+    median_h = max(1.0, float(np.median(heights)))
+
+    # Adaptive thresholds.
+    y_center_tol = 0.65 * median_h
+    max_x_gap = 4.0 * median_h
+
+    # Start from top-to-bottom, then left-to-right.
+    order = sorted(
+        range(n),
+        key=lambda i: (_y_center(bboxes[i]), float(bboxes[i][0]), i),
+    )
+
+    lines = []
+
+    for idx in order:
+        box = bboxes[idx]
+        yc = _y_center(box)
+
+        best = None
+        best_score = None
+
+        for li, line in enumerate(lines):
+            line_box = line["bbox"]
+
+            dy = abs(yc - line["y_center"])
+            overlap = _vertical_overlap_ratio(box, line_box)
+            x_gap = _horizontal_gap(box, line_box)
+
+            # Reject clearly different rows.
+            if overlap < 0.20 and dy > y_center_tol:
+                continue
+
+            # Reject distant columns.
+            if x_gap > max_x_gap:
+                continue
+
+            score = (
+                dy / median_h
+                + 0.20 * (x_gap / max_x_gap)
+                - 1.50 * overlap
+            )
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best = li
+
+        if best is None:
+            lines.append(
+                {
+                    "indices": [idx],
+                    "bbox": [
+                        float(box[0]),
+                        float(box[1]),
+                        float(box[2]),
+                        float(box[3]),
+                    ],
+                    "y_center": yc,
+                }
+            )
+        else:
+            line = lines[best]
+            line["indices"].append(idx)
+            line["bbox"] = [
+                min(line["bbox"][0], float(box[0])),
+                min(line["bbox"][1], float(box[1])),
+                max(line["bbox"][2], float(box[2])),
+                max(line["bbox"][3], float(box[3])),
+            ]
+            line["y_center"] = float(
+                np.mean([_y_center(bboxes[j]) for j in line["indices"]])
+            )
+
+    # Always enforce left-to-right order inside each visual line.
+    for line in lines:
+        line["indices"].sort(
+            key=lambda i: (float(bboxes[i][0]), _y_center(bboxes[i]), i)
+        )
+
+    # Temporary top-to-bottom ordering for deterministic region construction.
+    lines.sort(
+        key=lambda line: (
+            float(line["bbox"][1]),
+            float(line["bbox"][0]),
+        )
+    )
+
+    return lines
+
+
+# ==============================================================================
+# STEP 2: XY-CUT ON LINE REGIONS (NOT ON INDIVIDUAL WORDS)
+# ==============================================================================
+
+def _largest_gap_split(regions, axis, median_h):
+    """
+    Find the largest meaningful whitespace split.
+
+    axis=0 -> vertical partition (left/right), searching x gaps.
+    axis=1 -> horizontal partition (top/bottom), searching y gaps.
+    """
+    if len(regions) <= 1:
+        return None
+
+    start = 0 if axis == 0 else 1
+    end = 2 if axis == 0 else 3
+
+    ordered = sorted(
+        regions,
+        key=lambda r: (
+            float(r["bbox"][start]),
+            float(r["bbox"][end]),
+        ),
+    )
+
+    best_gap = -1.0
+    best_index = -1
+    running_end = float(ordered[0]["bbox"][end])
+
+    for i in range(1, len(ordered)):
+        current_start = float(ordered[i]["bbox"][start])
+        gap = current_start - running_end
+
+        if gap > best_gap:
+            best_gap = gap
+            best_index = i
+
+        running_end = max(
+            running_end,
+            float(ordered[i]["bbox"][end]),
+        )
+
+    if best_index <= 0 or best_index >= len(ordered):
+        return None
+
+    # Normalise by text height so the algorithm is scale-robust.
+    gap_ratio = best_gap / median_h
+
+    # Vertical whitespace between adjacent text lines is usually small.
+    # Column gaps are typically much wider.
+    if axis == 0:
+        min_ratio = 1.50
+    else:
+        min_ratio = 0.85
+
+    if gap_ratio < min_ratio:
+        return None
+
+    return {
+        "regions_a": ordered[:best_index],
+        "regions_b": ordered[best_index:],
+        "gap": best_gap,
+        "score": gap_ratio,
+        "axis": axis,
+    }
+
+
+def xy_cut_reading_order(lines, median_h):
+    """
+    Recursive XY-Cut over visual-line bounding regions.
+
+    The recursion first looks for a genuine whitespace partition. At each
+    node both x- and y-splits are considered; the strongest normalized gap is
+    selected. Leaves are emitted top-to-bottom and left-to-right.
+    """
+    if len(lines) <= 1:
+        return list(lines)
+
+    candidates = []
+
+    x_split = _largest_gap_split(
+        lines,
+        axis=0,
+        median_h=median_h,
+    )
+    y_split = _largest_gap_split(
+        lines,
+        axis=1,
+        median_h=median_h,
+    )
+
+    if x_split is not None:
+        # Give a modest preference to a strong column gap.
+        x_split["score"] *= 1.10
+        candidates.append(x_split)
+
+    if y_split is not None:
+        candidates.append(y_split)
+
+    if not candidates:
+        return sorted(
+            lines,
+            key=lambda line: (
+                float(line["bbox"][1]),
+                float(line["bbox"][0]),
+            ),
+        )
+
+    split = max(candidates, key=lambda x: x["score"])
+
+    left = xy_cut_reading_order(
+        split["regions_a"],
+        median_h,
+    )
+    right = xy_cut_reading_order(
+        split["regions_b"],
+        median_h,
+    )
+
+    return left + right
+
+
+# ==============================================================================
+# STEP 3: BUILD AUTO SEGMENTS FROM THE READING-ORDERED VISUAL LINES
+# ==============================================================================
+
+def build_reading_order_and_segments(bboxes):
+    """
+    Geometry-only pipeline:
+
+        word boxes
+            -> visual lines
+            -> XY-Cut reading order
+            -> one visual line = one heuristic segment
+
+    Returns:
+        order: word indices in reading order
+        seg_ids_orig: segment ID for every original word index
+
+    No dataset-provided segment information is used.
+    """
+    if not bboxes:
+        return [], []
+
+    lines = build_visual_lines(bboxes)
+
+    if not lines:
+        return list(range(len(bboxes))), list(range(len(bboxes)))
+
+    median_h = max(
+        1.0,
+        float(np.median([line["bbox"][3] - line["bbox"][1] for line in lines])),
+    )
+
+    ordered_lines = xy_cut_reading_order(
+        lines,
+        median_h,
+    )
+
+    # Flatten visual lines into the final reading order.
+    order = []
+
+    # Segment ID is defined by the ordered visual line.
+    seg_ids_orig = [-1] * len(bboxes)
+
+    for seg_id, line in enumerate(ordered_lines):
+        for idx in line["indices"]:
+            order.append(idx)
+            seg_ids_orig[idx] = seg_id
+
+    # Defensive consistency check.
+    if len(order) != len(bboxes) or len(set(order)) != len(bboxes):
+        order = list(range(len(bboxes)))
+
+    for i, sid in enumerate(seg_ids_orig):
+        if sid < 0:
+            seg_ids_orig[i] = i
+
+    return order, seg_ids_orig
+
+
+# ==============================================================================
+# OPTIONAL HIERARCHICAL POSITION IDS
+# ==============================================================================
+
+def compute_line_ids(bboxes):
+    """
+    Compute line IDs from the already reading-ordered boxes.
+
+    IDs follow the same visual-line construction used for segmentation.
+    """
+    if not bboxes:
+        return []
+
+    lines = build_visual_lines(bboxes)
+    line_map = [-1] * len(bboxes)
+
+    # Sort by first occurrence in the current reading-order list.
+    lines.sort(key=lambda line: min(line["indices"]))
+
+    for lid, line in enumerate(lines):
+        for idx in line["indices"]:
+            line_map[idx] = lid
+
+    for i in range(len(line_map)):
+        if line_map[i] < 0:
+            line_map[i] = i
+
+    return line_map
+
+
+def compute_block_ids(bboxes, x_threshold=50, y_threshold=30):
+    """
+    Conservative spatial block IDs on reading-ordered boxes.
+    """
+    if not bboxes:
+        return []
+
+    centers = [
+        (_x_center(box), _y_center(box))
+        for box in bboxes
+    ]
+
+    blocks = [0]
+    current_block = 0
+
+    for i in range(1, len(centers)):
+        dx = centers[i][0] - centers[i - 1][0]
+        dy = centers[i][1] - centers[i - 1][1]
+
+        if abs(dx) > x_threshold or abs(dy) > y_threshold:
+            current_block += 1
+
+        blocks.append(current_block)
+
+    return blocks
+
+
+def compute_column_ids(bboxes, x_threshold=50):
+    """
+    Column IDs estimated from x-centers in reading order.
+    """
+    if not bboxes:
+        return []
+
+    x_centers = [_x_center(box) for box in bboxes]
+    columns = [0]
+    current_col = 0
+
+    for i in range(1, len(x_centers)):
+        if abs(x_centers[i] - x_centers[i - 1]) > x_threshold:
+            current_col += 1
+
+        columns.append(current_col)
+
+    return columns
+
+
+def compute_entity_ids(label_ids_aligned, label_list):
+    """
+    Assign a unique ID to each contiguous entity for downstream models
+    expecting entity_ids.
+    """
+    entity_ids = []
+    current_id = -1
+    prev_type = None
+
+    for lid in label_ids_aligned:
+        if lid == -100:
+            entity_ids.append(-1)
+            continue
+
+        label_str = label_list[lid]
+
+        if label_str == "O":
+            entity_ids.append(-1)
+            prev_type = None
+            continue
+
+        prefix, entity_type = label_str.split("-", 1)
+
+        if prefix == "B" or entity_type != prev_type:
+            current_id += 1
+
+        entity_ids.append(current_id)
+        prev_type = entity_type
+
+    return entity_ids
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
 
 def main():
-    # See all possible arguments in layoutlmft/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
+    parser = HfArgumentParser(
+        (ModelArguments, DataTrainingArguments, TrainingArguments)
+    )
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1])
+        )
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Detecting last checkpoint.
+    # --------------------------------------------------------------------------
+    # Checkpoints
+    # --------------------------------------------------------------------------
     last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+
+    if (
+        os.path.isdir(training_args.output_dir)
+        and training_args.do_train
+        and not training_args.overwrite_output_dir
+    ):
+        last_checkpoint = get_last_checkpoint(
+            training_args.output_dir
+        )
+
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
                 "Use --overwrite_output_dir to overcome."
             )
+
         elif last_checkpoint is not None:
             logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+                f"Checkpoint detected, resuming training at {last_checkpoint}. "
+                "To avoid this behavior, change the output_dir or add "
+                "--overwrite_output_dir to train from scratch."
             )
 
-    # Setup logging
+    # --------------------------------------------------------------------------
+    # Logging
+    # --------------------------------------------------------------------------
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
 
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    logger.setLevel(
+        logging.INFO
+        if is_main_process(training_args.local_rank)
+        else logging.WARN
     )
-    # Set the verbosity to info of the Transformers logger (on main process only):
+
     if is_main_process(training_args.local_rank):
         transformers.utils.logging.set_verbosity_info()
         transformers.utils.logging.enable_default_handler()
         transformers.utils.logging.enable_explicit_format()
-    logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Set seed before initializing model.
+    logger.info(
+        f"Training/evaluation parameters {training_args}"
+    )
+
+    # --------------------------------------------------------------------------
+    # Seed
+    # --------------------------------------------------------------------------
     set_seed(training_args.seed)
 
-    if data_args.dataset_name == 'funsd':
-        # datasets = load_dataset("nielsr/funsd")
+    # --------------------------------------------------------------------------
+    # Dataset
+    # --------------------------------------------------------------------------
+    if data_args.dataset_name == "funsd":
         import layoutlmft.data.funsd
-        datasets = load_dataset(os.path.abspath(layoutlmft.data.funsd.__file__), cache_dir=model_args.cache_dir)
-    elif data_args.dataset_name == 'cord':
+
+        datasets = load_dataset(
+            os.path.abspath(layoutlmft.data.funsd.__file__),
+            cache_dir=model_args.cache_dir,
+        )
+
+    elif data_args.dataset_name == "cord":
         import layoutlmft.data.cord
-        datasets = load_dataset(os.path.abspath(layoutlmft.data.cord.__file__), cache_dir=model_args.cache_dir)
+
+        datasets = load_dataset(
+            os.path.abspath(layoutlmft.data.cord.__file__),
+            cache_dir=model_args.cache_dir,
+        )
+
     else:
-        raise NotImplementedError()
+        raise NotImplementedError(
+            f"Unsupported dataset_name={data_args.dataset_name}. "
+            "This runner supports FUNSD and CORD."
+        )
+
+    if training_args.do_train:
+        column_names = datasets["train"].column_names
+        features = datasets["train"].features
+    else:
+        column_names = datasets["test"].column_names
+        features = datasets["test"].features
+
+    text_column_name = (
+        "words"
+        if "words" in column_names
+        else "tokens"
+    )
+
+    label_column_name = (
+        f"{data_args.task_name}_tags"
+        if f"{data_args.task_name}_tags" in column_names
+        else column_names[1]
+    )
+
+    remove_columns = column_names
+
+    if isinstance(
+        features[label_column_name].feature,
+        ClassLabel,
+    ):
+        label_list = features[label_column_name].feature.names
+        label_to_id = {
+            i: i
+            for i in range(len(label_list))
+        }
+    else:
+        unique_labels = set()
+
+        for label_seq in datasets["train"][label_column_name]:
+            unique_labels = unique_labels | set(label_seq)
+
+        label_list = sorted(list(unique_labels))
+        label_to_id = {
+            label: i
+            for i, label in enumerate(label_list)
+        }
+
+    num_labels = len(label_list)
+
+    # --------------------------------------------------------------------------
+    # Model config
+    # --------------------------------------------------------------------------
+    config = AutoConfig.from_pretrained(
+        model_args.config_name
+        if model_args.config_name
+        else model_args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=data_args.task_name,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        input_size=data_args.input_size,
+        use_auth_token=(
+            True if model_args.use_auth_token else None
+        ),
+        use_hierarchical_position_encoding=(
+            model_args.use_hierarchical_position_encoding
+        ),
+        max_line_position=model_args.max_line_position,
+        max_block_position=model_args.max_block_position,
+        use_column_encoding=model_args.use_column_encoding,
+        max_column_position=model_args.max_column_position,
+        use_intra_line_boundary=model_args.use_intra_line_boundary,
+        lambda_bound_init=model_args.lambda_bound_init,
+        use_semantic_geometry_disentangle=(
+            model_args.use_semantic_geometry_disentangle
+        ),
+        lambda_geo_init=model_args.lambda_geo_init,
+        lambda_orth_init=model_args.lambda_orth_init,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name
+        if model_args.tokenizer_name
+        else model_args.model_name_or_path,
+        tokenizer_file=None,
+        cache_dir=model_args.cache_dir,
+        use_fast=True,
+        add_prefix_space=True,
+        revision=model_args.model_revision,
+        use_auth_token=(
+            True if model_args.use_auth_token else None
+        ),
+    )
+
+    if getattr(data_args, "use_segment_head", False):
+        from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
+            LayoutLMv3ForSegmentTokenClassification,
+        )
+
+        model = (
+            LayoutLMv3ForSegmentTokenClassification.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(
+                    ".ckpt" in model_args.model_name_or_path
+                ),
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=(
+                    True if model_args.use_auth_token else None
+                ),
+            )
+        )
+    else:
+        model = AutoModelForTokenClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(
+                ".ckpt" in model_args.model_name_or_path
+            ),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=(
+                True if model_args.use_auth_token else None
+            ),
+        )
+
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        raise ValueError(
+            "This example script only works for models that have a fast tokenizer."
+        )
+
+    # --------------------------------------------------------------------------
+    # Visual preprocessing
+    # --------------------------------------------------------------------------
+    padding = (
+        "max_length"
+        if data_args.pad_to_max_length
+        else False
+    )
+
+    if data_args.visual_embed:
+        imagenet_default_mean_and_std = (
+            data_args.imagenet_default_mean_and_std
+        )
+
+        mean = (
+            IMAGENET_INCEPTION_MEAN
+            if not imagenet_default_mean_and_std
+            else IMAGENET_DEFAULT_MEAN
+        )
+
+        std = (
+            IMAGENET_INCEPTION_STD
+            if not imagenet_default_mean_and_std
+            else IMAGENET_DEFAULT_STD
+        )
+
+        common_transform = Compose(
+            [
+                RandomResizedCropAndInterpolationWithTwoPic(
+                    size=data_args.input_size,
+                    interpolation=data_args.train_interpolation,
+                ),
+            ]
+        )
+
+        patch_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=torch.tensor(mean),
+                    std=torch.tensor(std),
+                ),
+            ]
+        )
+
+    # --------------------------------------------------------------------------
+    # Tokenization + geometry-only reading order + auto segmentation
+    # --------------------------------------------------------------------------
+    def tokenize_and_align_labels(examples, augmentation=False):
+        # Build the geometry-only reading order BEFORE tokenization.
+        reordered_words = []
+        reordered_bboxes = []
+        reordered_labels = []
+        reordered_orders = []
+
+        for sample_idx in range(
+            len(examples[text_column_name])
+        ):
+            words_i = examples[text_column_name][sample_idx]
+            bboxes_i = examples["bboxes"][sample_idx]
+            labels_i = examples[label_column_name][sample_idx]
+
+            if (
+                getattr(data_args, "apply_xy_cut", True)
+                and len(bboxes_i) > 1
+            ):
+                order, _ = build_reading_order_and_segments(
+                    bboxes_i
+                )
+            else:
+                order = list(range(len(bboxes_i)))
+
+            reordered_orders.append(order)
+
+            reordered_words.append(
+                [words_i[j] for j in order]
+            )
+            reordered_bboxes.append(
+                [bboxes_i[j] for j in order]
+            )
+            reordered_labels.append(
+                [labels_i[j] for j in order]
+            )
+
+        tokenized_inputs = tokenizer(
+            reordered_words,
+            padding=False,
+            truncation=True,
+            return_overflowing_tokens=True,
+            is_split_into_words=True,
+        )
+
+        labels = []
+        bboxes = []
+        images = []
+
+        seg_ids = []
+        line_ids_all = []
+        block_ids_all = []
+        column_ids_all = []
+        entity_ids_all = []
+
+        for batch_index in range(
+            len(tokenized_inputs["input_ids"])
+        ):
+            word_ids = tokenized_inputs.word_ids(
+                batch_index=batch_index
+            )
+
+            original_batch_index = (
+                tokenized_inputs[
+                    "overflow_to_sample_mapping"
+                ][batch_index]
+            )
+
+            label = reordered_labels[
+                original_batch_index
+            ]
+            bbox = reordered_bboxes[
+                original_batch_index
+            ]
+            words = reordered_words[
+                original_batch_index
+            ]
+
+            # --------------------------------------------------------------
+            # AUTO SEGMENTS: rebuild from the reordered word boxes.
+            #
+            # Absolutely no dataset-provided segment IDs are read here.
+            # --------------------------------------------------------------
+            if getattr(
+                data_args,
+                "use_segment_head",
+                False,
+            ):
+                _, word_seg_id = (
+                    build_reading_order_and_segments(
+                        bbox
+                    )
+                )
+            else:
+                word_seg_id = None
+
+            line_ids_orig = compute_line_ids(bbox)
+            block_ids_orig = compute_block_ids(bbox)
+            column_ids_orig = compute_column_ids(bbox)
+
+            previous_word_idx = None
+
+            label_ids = []
+            bbox_inputs = []
+            seg_id_inputs = []
+            line_ids_aligned = []
+            block_ids_aligned = []
+            column_ids_aligned = []
+
+            for word_idx in word_ids:
+                if word_idx is None:
+                    label_ids.append(-100)
+                    bbox_inputs.append(
+                        [0, 0, 0, 0]
+                    )
+
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(-1)
+
+                    line_ids_aligned.append(-1)
+                    block_ids_aligned.append(-1)
+                    column_ids_aligned.append(-1)
+
+                elif word_idx != previous_word_idx:
+                    label_ids.append(
+                        label_to_id[
+                            label[word_idx]
+                        ]
+                    )
+
+                    bbox_inputs.append(
+                        bbox[word_idx]
+                    )
+
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(
+                            word_seg_id[word_idx]
+                        )
+
+                    line_ids_aligned.append(
+                        line_ids_orig[word_idx]
+                    )
+                    block_ids_aligned.append(
+                        block_ids_orig[word_idx]
+                    )
+                    column_ids_aligned.append(
+                        column_ids_orig[word_idx]
+                    )
+
+                else:
+                    label_ids.append(
+                        label_to_id[
+                            label[word_idx]
+                        ]
+                        if data_args.label_all_tokens
+                        else -100
+                    )
+
+                    bbox_inputs.append(
+                        bbox[word_idx]
+                    )
+
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(
+                            word_seg_id[word_idx]
+                        )
+
+                    line_ids_aligned.append(
+                        line_ids_orig[word_idx]
+                    )
+                    block_ids_aligned.append(
+                        block_ids_orig[word_idx]
+                    )
+                    column_ids_aligned.append(
+                        column_ids_orig[word_idx]
+                    )
+
+                previous_word_idx = word_idx
+
+            labels.append(label_ids)
+            bboxes.append(bbox_inputs)
+
+            if word_seg_id is not None:
+                seg_ids.append(seg_id_inputs)
+
+            line_ids_all.append(line_ids_aligned)
+            block_ids_all.append(block_ids_aligned)
+            column_ids_all.append(column_ids_aligned)
+
+            entity_ids_all.append(
+                compute_entity_ids(
+                    label_ids,
+                    label_list,
+                )
+            )
+
+            if data_args.visual_embed:
+                ipath = examples["image_path"][
+                    original_batch_index
+                ]
+
+                img = pil_loader(ipath)
+
+                for_patches, _ = common_transform(
+                    img,
+                    augmentation=augmentation,
+                )
+
+                patch = patch_transform(
+                    for_patches
+                )
+
+                images.append(patch)
+
+        tokenized_inputs["labels"] = labels
+        tokenized_inputs["bbox"] = bboxes
+        tokenized_inputs["line_ids"] = line_ids_all
+        tokenized_inputs["block_ids"] = block_ids_all
+        tokenized_inputs["column_ids"] = column_ids_all
+        tokenized_inputs["entity_ids"] = entity_ids_all
+
+        if getattr(
+            data_args,
+            "use_segment_head",
+            False,
+        ):
+            tokenized_inputs["seg_id"] = seg_ids
+
+        if data_args.visual_embed:
+            tokenized_inputs["images"] = images
+
+        return tokenized_inputs
 
     if training_args.do_train:
         column_names = datasets["train"].column_names
@@ -372,7 +1186,6 @@ def main():
             RandomResizedCropAndInterpolationWithTwoPic(
                 size=data_args.input_size, interpolation=data_args.train_interpolation),
         ])
-        import torch
         patch_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
@@ -698,7 +1511,6 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
-    import torch
     # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
     class CustomTrainer(Trainer):
         def create_optimizer(self):

@@ -7,29 +7,28 @@ export PYTHONPATH="/home/s24gbn1/Documents/httn/unilm/layoutlmv3:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=true 
 
-SEEDS=(42 123 1993)
-BASE_OUT_DIR="./logs/funsd-base-segment-hipos-token-0.03"
+SEEDS=(42 123 1993) 
+BASE_OUT_DIR="./logs/funsd-base-segment-nssr"
 BROADCAST_MODE=${BROADCAST_MODE:-"additive"}
 for SEED in "${SEEDS[@]}"
 do
     OUT_DIR="${BASE_OUT_DIR}-seed${SEED}"
-    
     echo ""
     echo "============================================================"
     echo "RUNNING FUNSD BASE (SEGMENT HEAD + HIPOS) - SEED = ${SEED}"
     echo "============================================================"
-    
-
     python -m torch.distributed.run \
       --nproc_per_node=1 \
-      --master_port=4398 \
+      --master_port=4400 \
       examples/run_funsd_cord.py \
       --dataset_name funsd \
       --do_train --do_eval \
       --use_segment_head \
+      --segment_train_predictions_dir ./segment_outputs/v4_train \
+      --segment_eval_predictions_dir ./segment_outputs/v4_test \
       --model_name_or_path models/layoutlmv3-base \
       --output_dir "$OUT_DIR" \
-      --segment_level_layout 1 --visual_embed 1 --input_size 224 \
+      --segment_level_layout 0 --visual_embed 1 --input_size 224 \
       --max_steps 1000 --save_steps 1000 --evaluation_strategy steps --eval_steps 100 \
       --learning_rate 1e-5 \
       --warmup_ratio 0.1 \
@@ -38,14 +37,7 @@ do
       --dataloader_num_workers 4 \
       --report_to none \
       --seed "$SEED" \
-      --overwrite_output_dir --overwrite_cache \
-      --use_hierarchical_position_encoding \
-      --max_line_position 100 \
-      --max_block_position 30 \
-      --use_column_encoding True \
-      --max_column_position 8 \
-      --use_intra_line_boundary True \
-      --lambda_bound_init 0.1
+      --overwrite_output_dir --overwrite_cache
 done
 
 echo ""

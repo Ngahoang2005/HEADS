@@ -128,7 +128,7 @@ class Funsd(datasets.GeneratorBasedBuilder):
                         cur_line_bboxes.append(normalize_bbox(w["box"], size))
                 # by default: --segment_level_layout 1
                 # if do not want to use segment_level_layout, comment the following line
-                cur_line_bboxes = self.get_line_bbox(cur_line_bboxes)
+                #cur_line_bboxes = self.get_line_bbox(cur_line_bboxes)
                 # box = normalize_bbox(item["box"], size)
                 # cur_line_bboxes = [box for _ in range(len(words))]
                 bboxes.extend(cur_line_bboxes)

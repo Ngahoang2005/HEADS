@@ -4,7 +4,7 @@
 """
 segment_v4_pixel.py
 
-Word-level trainable segment grouping for FUNSD with pixel evidence.
+Word-level trainable segment grouping for FUNSD and CORD with pixel evidence.
 
 Main idea
 ---------
@@ -17,7 +17,7 @@ word hidden states
 symmetric word-pair relation head
         |
         v
-P(same FUNSD form.id)
+P(same FUNSD form.id / CORD valid_line)
         |
         v
 adaptive graph clustering
@@ -27,7 +27,7 @@ final layout segments
 
 Important
 ---------
-Standard FUNSD annotations do NOT contain segment_id.
+FUNSD uses form.id as its grouping target; CORD uses valid_line spans.
 
 Therefore the default gold target is:
 
@@ -1475,7 +1475,72 @@ def flatten_funsd_words(data):
     return words, entities
 
 
-def load_page_annotation(path):
+def flatten_cord_words(data):
+    """Flatten CORD valid_line annotations into word nodes.
+
+    Each valid_line entry is used as the segment supervision unit, matching
+    cord.py's BIO construction: all non-empty words inside one valid_line
+    item form one labeled span. The `group_id` field is deliberately not used
+    here because it may link different semantic fields in a receipt row.
+    """
+    words = []
+    entities = {}
+    next_word = 0
+
+    for line_id, item in enumerate(data.get("valid_line", [])):
+        label = str(item.get("category", "other"))
+        raw_words = item.get("words", [])
+        kept = []
+
+        for raw_word in raw_words:
+            text = str(raw_word.get("text", "")).strip()
+            if not text:
+                continue
+
+            quad = raw_word.get("quad", {}) or {}
+            if not isinstance(quad, dict):
+                raise ValueError(
+                    "CORD quad must be a dict with x1/y1/x3/y3; got {!r}".format(quad)
+                )
+
+            try:
+                # Match quad_to_box() in the user's cord.py. parse_box() also
+                # repairs reversed corners seen in a few CORD annotations.
+                raw_box = [
+                    max(0.0, float(quad["x1"])),
+                    max(0.0, float(quad["y1"])),
+                    float(quad["x3"]),
+                    float(quad["y3"]),
+                ]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Invalid CORD quad for valid_line {} word {!r}: {!r}".format(
+                        line_id, text, quad
+                    )
+                ) from exc
+
+            word = Word(
+                idx=next_word,
+                text=text,
+                box=parse_box(raw_box),
+                entity_id=line_id,
+                entity_label=label,
+            )
+            word.segment_id = str(line_id)
+            words.append(word)
+            kept.append(text)
+            next_word += 1
+
+        if kept:
+            entities[line_id] = {
+                "label": label,
+                "text": " ".join(kept),
+            }
+
+    return words, entities
+
+
+def load_page_annotation(path, dataset_format="funsd"):
 
     with open(
         str(path),
@@ -1484,18 +1549,21 @@ def load_page_annotation(path):
     ) as f:
         data = json.load(f)
 
-    words, entities = flatten_funsd_words(
-        data
-    )
-
-    # Standard FUNSD:
-    # form.id is the gold grouping target.
-    for w in words:
-
-        if w.entity_id >= 0:
-            w.segment_id = str(
-                w.entity_id
+    if dataset_format == "cord":
+        if "valid_line" not in data:
+            raise ValueError(
+                "Expected CORD annotation with key 'valid_line': {}".format(path)
             )
+        words, entities = flatten_cord_words(data)
+    elif dataset_format == "funsd":
+        words, entities = flatten_funsd_words(data)
+    else:
+        raise ValueError("Unsupported dataset format: {}".format(dataset_format))
+
+    # FUNSD target: form.id. CORD target: valid_line item index.
+    for w in words:
+        if w.entity_id >= 0:
+            w.segment_id = str(w.entity_id)
         else:
             w.segment_id = None
 
@@ -2528,6 +2596,7 @@ def prepare_page(
     use_gold_candidate_injection=False,
     top_k=DEFAULT_TOP_K,
     pixel_top_k=24,
+    dataset_format="funsd",
 ):
 
     image = Image.open(
@@ -2535,7 +2604,8 @@ def prepare_page(
     ).convert("RGB")
 
     words, entities = load_page_annotation(
-        annotation_path
+        annotation_path,
+        dataset_format=dataset_format,
     )
 
     if not words:
@@ -4144,7 +4214,7 @@ def visualize_page(
         axes[1],
         image,
         words,
-        "Gold FUNSD form.id",
+        "Gold segment labels",
     )
 
     fig.suptitle(
@@ -4177,41 +4247,58 @@ def visualize_page(
 # Files
 # =============================================================================
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def resolve_image_path(image_dir, stem):
+    """Resolve an image by stem; prefer PNG to preserve the original runner's behavior."""
+    image_dir = Path(image_dir)
+    for extension in IMAGE_EXTENSIONS:
+        candidate = image_dir / (str(stem) + extension)
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "No image for stem {!r} in {} (tried {})".format(
+            stem, image_dir, ", ".join(IMAGE_EXTENSIONS)
+        )
+    )
+
+
 def list_stems(
     image_dir,
     annotation_dir,
 ):
+    image_dir = Path(image_dir)
+    annotation_dir = Path(annotation_dir)
+    if not image_dir.is_dir():
+        raise FileNotFoundError("Image directory not found: {}".format(image_dir))
+    if not annotation_dir.is_dir():
+        raise FileNotFoundError("Annotation directory not found: {}".format(annotation_dir))
 
-    image_dir = Path(
-        image_dir
-    )
-
-    annotation_dir = Path(
-        annotation_dir
-    )
-
+    # Drive the list from annotations so unmatched images cannot silently vanish.
+    # resolve_image_path chooses the preferred image if duplicate extensions exist.
     stems = []
-
-    for image_path in sorted(
-        image_dir.glob(
-            "*.png"
-        )
-    ):
-
-        annotation_path = (
-            annotation_dir /
-            (
-                image_path.stem +
-                ".json"
+    missing_images = []
+    for ann_path in sorted(annotation_dir.glob("*.json")):
+        try:
+            resolve_image_path(image_dir, ann_path.stem)
+        except FileNotFoundError:
+            missing_images.append(ann_path.stem)
+            continue
+        stems.append(ann_path.stem)
+    if missing_images:
+        preview = ", ".join(missing_images[:10])
+        raise RuntimeError(
+            "Found {} annotation(s) without matching image in {}. First stems: {}".format(
+                len(missing_images), image_dir, preview
             )
         )
-
-        if annotation_path.exists():
-
-            stems.append(
-                image_path.stem
+    if not stems:
+        raise RuntimeError(
+            "No matched image/annotation pairs in image_dir={} annotation_dir={}".format(
+                image_dir, annotation_dir
             )
-
+        )
     return stems
 
 
@@ -4682,9 +4769,7 @@ def train(args):
         page = prepare_page(
             tokenizer,
             model,
-            train_images / (
-                stem + ".png"
-            ),
+            resolve_image_path(train_images, stem),
             train_annotations / (
                 stem + ".json"
             ),
@@ -4693,6 +4778,7 @@ def train(args):
             use_gold_candidate_injection=True,
             top_k=args.top_k,
             pixel_top_k=args.pixel_top_k,
+            dataset_format=args.dataset_format,
         )
 
         if page is None:
@@ -4722,9 +4808,7 @@ def train(args):
         page = prepare_page(
             tokenizer,
             model,
-            val_images / (
-                stem + ".png"
-            ),
+            resolve_image_path(val_images, stem),
             val_annotations / (
                 stem + ".json"
             ),
@@ -4733,6 +4817,7 @@ def train(args):
             use_gold_candidate_injection=False,
             top_k=args.top_k,
             pixel_top_k=args.pixel_top_k,
+            dataset_format=args.dataset_format,
         )
 
         if page is None:
@@ -5142,16 +5227,11 @@ def diagnose(args):
             )
         )
 
-        image_path = (
-            image_dir /
-            (
-                stem +
-                ".png"
-            )
-        )
+        image_path = resolve_image_path(image_dir, stem)
 
         words, entities = load_page_annotation(
-            annotation_path
+            annotation_path,
+            dataset_format=args.dataset_format,
         )
 
         page_box = union_boxes(
@@ -5238,6 +5318,7 @@ def diagnose(args):
             args.max_length,
             use_gold_candidate_injection=False,
             top_k=args.top_k,
+            dataset_format=args.dataset_format,
         )
 
         page["stem"] = stem
@@ -5505,13 +5586,7 @@ def predict(args):
             "=" * 60
         )
 
-        image_path = (
-            image_dir /
-            (
-                stem +
-                ".png"
-            )
-        )
+        image_path = resolve_image_path(image_dir, stem)
 
         ann_path = (
             ann_dir /
@@ -5526,7 +5601,8 @@ def predict(args):
         ).convert("RGB")
 
         words, entities = load_page_annotation(
-            ann_path
+            ann_path,
+            dataset_format=args.dataset_format,
         )
 
         page_box = union_boxes(
@@ -5901,12 +5977,19 @@ def add_model_args(parser):
         default=MAX_TEXT_LEN,
     )
 
+    parser.add_argument(
+        "--dataset-format",
+        choices=("funsd", "cord"),
+        default="funsd",
+        help="Annotation schema: FUNSD form.id or CORD valid_line.",
+    )
+
 
 def build_parser():
 
     parser = argparse.ArgumentParser(
         description=(
-            "FUNSD word-level segment grouping V4 pixel-aware"
+            "Word-level segment grouping V4 pixel-aware for FUNSD or CORD"
         )
     )
 

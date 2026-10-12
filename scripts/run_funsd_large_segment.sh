@@ -8,7 +8,7 @@ export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=true 
 
 SEEDS=(42 123 1993) 
-BASE_OUT_DIR="./logs/funsd-large-segment-v3-nssr"
+BASE_OUT_DIR="./logs/funsd-large-segment-lrx1"
 BROADCAST_MODE=${BROADCAST_MODE:-"additive"}
 for SEED in "${SEEDS[@]}"
 do
@@ -24,9 +24,9 @@ do
       --dataset_name funsd \
       --do_train --do_eval \
       --use_segment_head \
-      --segment_train_predictions_dir ./predicted_segment/funsd/train \
-      --segment_eval_predictions_dir ./predicted_segment/funsd/test \
-      --model_name_or_path /home/s24gbn1/Documents/phg/unilm/layoutlmv3/models/layoutlmv3-large \
+      --segment_train_predictions_dir ./segment_outputs/v4_train \
+      --segment_eval_predictions_dir ./segment_outputs/v4_test \
+      --model_name_or_path models/layoutlmv3-large \
       --output_dir "$OUT_DIR" \
       --segment_level_layout 0 --visual_embed 1 --input_size 224 \
       --max_steps 1000 --save_steps 1000 --evaluation_strategy steps --eval_steps 100 \

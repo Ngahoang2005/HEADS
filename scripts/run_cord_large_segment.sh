@@ -7,8 +7,8 @@ export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=true 
 
 SEEDS=(42 123 1993)
-BASE_OUT_DIR="./logs/cord-large-segment-token-0.03"
-
+BASE_OUT_DIR="./logs/cord-large-segment"
+BROADCAST_MODE=${BROADCAST_MODE:-"additive"}  # default = additive (fix: cộng dồn context-delta vào token gốc thay vì ghi đè hoàn toàn)
 for SEED in "${SEEDS[@]}"
 do
     OUT_DIR="${BASE_OUT_DIR}-seed${SEED}"
@@ -27,6 +27,8 @@ do
       --dataset_name cord \
       --do_train --do_eval --do_predict \
       --use_segment_head \
+      --segment_train_predictions_dir ./segment_outputs/cord/v4_train \
+      --segment_eval_predictions_dir ./segment_outputs/cord/v4_test \
       --model_name_or_path models/layoutlmv3-large \
       --output_dir "$OUT_DIR" \
       --segment_level_layout 1 --visual_embed 1 --input_size 224 \
@@ -37,7 +39,9 @@ do
       --dataloader_num_workers 4 \
       --report_to none \
       --seed "$SEED" \
-      --overwrite_output_dir --overwrite_cache
+      --overwrite_output_dir \
+      --overwrite_cache
+
 done
 
 echo ""

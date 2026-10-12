@@ -7,7 +7,7 @@ export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=true 
 
 SEEDS=(42 123 1993)
-BASE_OUT_DIR="./logs/cord-base-segment-token-0.03"
+BASE_OUT_DIR="./logs/cord-base-segment-lrx0.25"
 BROADCAST_MODE=${BROADCAST_MODE:-"additive"}  # default = additive (fix: cộng dồn context-delta vào token gốc thay vì ghi đè hoàn toàn)
 for SEED in "${SEEDS[@]}"
 do
@@ -22,11 +22,13 @@ do
 
     python -m torch.distributed.run \
       --nproc_per_node=1 \
-      --master_port=4400 \
+      --master_port=4398 \
       examples/run_funsd_cord.py \
       --dataset_name cord \
       --do_train --do_eval --do_predict \
       --use_segment_head \
+      --segment_train_predictions_dir ./segment_outputs/cord/v4_train \
+      --segment_eval_predictions_dir ./segment_outputs/cord/v4_test \
       --model_name_or_path models/layoutlmv3-base \
       --output_dir "$OUT_DIR" \
       --segment_level_layout 1 --visual_embed 1 --input_size 224 \
@@ -37,16 +39,8 @@ do
       --dataloader_num_workers 4 \
       --report_to none \
       --seed "$SEED" \
-      --overwrite_output_dir --overwrite_cache \
-      --use_hierarchical_position_encoding \
-      --use_hierarchical_position_encoding \
-      --max_line_position 80 \
-      --max_block_position 15 \
-      --use_column_encoding True \
-      --max_column_position 8 \
-      --use_intra_line_boundary True \
-      --lambda_bound_init 0.1 \
-     
+      --overwrite_output_dir \
+      --overwrite_cache
 
 done
 

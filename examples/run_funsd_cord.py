@@ -40,6 +40,170 @@ from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
 
+
+
+def xy_cut_order_segments(segments, word_bboxes, min_gap_ratio=0.012):
+    """Return predicted segments in recursive XY-cut reading order.
+
+    Segment membership is unchanged. Each segment's rectangle is the union of
+    its word-level bboxes (coordinates are normally normalized to 0..1000).
+    At each recursion, cut at the largest sufficiently wide whitespace gutter
+    in the x or y projection. Y cuts order top-to-bottom; X cuts order
+    left-to-right. If no safe gutter remains, use stable top-to-bottom,
+    left-to-right centroid order as a leaf fallback.
+
+    Args:
+        segments: list of segment dictionaries containing ``word_ids``.
+        word_bboxes: word-level bboxes aligned with the dataset ``words`` list.
+        min_gap_ratio: minimum gutter width relative to the full page span.
+
+    Returns:
+        A new list of the same segment dictionaries in reading order.
+    """
+    if not segments:
+        return []
+
+    records = []
+    unpositioned = []
+    for original_index, segment in enumerate(segments):
+        word_ids = segment.get("word_ids", [])
+        coords = []
+        for raw_wid in word_ids:
+            try:
+                wid = int(raw_wid)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= wid < len(word_bboxes):
+                raw_box = word_bboxes[wid]
+                if raw_box is None or len(raw_box) < 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = [float(v) for v in raw_box[:4]]
+                except (TypeError, ValueError):
+                    continue
+                if x1 < x0:
+                    x0, x1 = x1, x0
+                if y1 < y0:
+                    y0, y1 = y1, y0
+                coords.append((x0, y0, x1, y1))
+
+        if not coords:
+            unpositioned.append((original_index, segment))
+            continue
+
+        box = (
+            min(b[0] for b in coords),
+            min(b[1] for b in coords),
+            max(b[2] for b in coords),
+            max(b[3] for b in coords),
+        )
+        records.append({"index": original_index, "segment": segment, "box": box})
+
+    if not records:
+        return [seg for _, seg in sorted(unpositioned, key=lambda x: x[0])]
+
+    page_x_span = max(
+        max(r["box"][2] for r in records) - min(r["box"][0] for r in records), 1.0
+    )
+    page_y_span = max(
+        max(r["box"][3] for r in records) - min(r["box"][1] for r in records), 1.0
+    )
+    min_gap_x = max(1.0, page_x_span * float(min_gap_ratio))
+    min_gap_y = max(1.0, page_y_span * float(min_gap_ratio))
+    eps = 1e-6
+
+    def find_best_cut(items, axis):
+        if len(items) < 2:
+            return None
+        if axis == "x":
+            lo_i, hi_i = 0, 2
+            span, min_gap = page_x_span, min_gap_x
+        else:
+            lo_i, hi_i = 1, 3
+            span, min_gap = page_y_span, min_gap_y
+
+        intervals = sorted(
+            [(it["box"][lo_i], it["box"][hi_i], it["index"], it) for it in items],
+            key=lambda v: (v[0], v[1], v[2]),
+        )
+        merged = []
+        for lo, hi, _, _ in intervals:
+            if not merged or lo > merged[-1][1] + eps:
+                merged.append([lo, hi])
+            else:
+                merged[-1][1] = max(merged[-1][1], hi)
+
+        best = None
+        for k in range(len(merged) - 1):
+            left_edge = merged[k][1]
+            right_edge = merged[k + 1][0]
+            gap = right_edge - left_edge
+            if gap < min_gap:
+                continue
+
+            left_items = [it for it in items if it["box"][hi_i] <= left_edge + eps]
+            right_items = [it for it in items if it["box"][lo_i] >= right_edge - eps]
+            # Only make a cut when every item belongs wholly to exactly one side.
+            if not left_items or not right_items:
+                continue
+            if len(left_items) + len(right_items) != len(items):
+                continue
+
+            score = gap / span
+            # Prefer a horizontal separator (Y cut) on exact ties, giving
+            # top-to-bottom ordering before left-to-right ordering.
+            tie_priority = 1 if axis == "y" else 0
+            candidate = (score, tie_priority, left_items, right_items)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+
+        if best is None:
+            return None
+        return best[2], best[3], best[0]
+
+    def leaf_order(items):
+        return sorted(
+            items,
+            key=lambda it: (
+                0.5 * (it["box"][1] + it["box"][3]),
+                it["box"][0],
+                it["index"],
+            ),
+        )
+
+    def recurse(items, depth=0):
+        if len(items) <= 1:
+            return list(items)
+        # This guard is defensive; every successful cut must reduce both sides.
+        if depth > len(records):
+            return leaf_order(items)
+
+        x_cut = find_best_cut(items, "x")
+        y_cut = find_best_cut(items, "y")
+        chosen_axis = None
+        chosen = None
+        if x_cut is not None:
+            chosen_axis, chosen = "x", x_cut
+        if y_cut is not None:
+            if chosen is None or y_cut[2] > chosen[2] + eps:
+                chosen_axis, chosen = "y", y_cut
+            elif abs(y_cut[2] - chosen[2]) <= eps:
+                # Prefer Y for equal-width gutters.
+                chosen_axis, chosen = "y", y_cut
+
+        if chosen is None:
+            return leaf_order(items)
+        left_items, right_items, _ = chosen
+        return recurse(left_items, depth + 1) + recurse(right_items, depth + 1)
+
+    ordered_records = recurse(records)
+    ordered_segments = [record["segment"] for record in ordered_records]
+    # Preserve any empty/unpositioned segment deterministically at the end;
+    # word coverage validation below will still catch missing word assignments.
+    ordered_segments.extend(seg for _, seg in sorted(unpositioned, key=lambda x: x[0]))
+    return ordered_segments
+
+
 @dataclass
 class ModelArguments:
     """
@@ -581,7 +745,13 @@ def main():
                 raw_to_local = {}
                 next_local_sid = 0
 
-                for seg in seg_data.get("segments", []):
+                # Recursive XY-cut is applied AFTER V4 has predicted segment
+                # membership. It changes only the order in which segment IDs
+                # are assigned; it does not merge/split or relabel membership.
+                predicted_segments = seg_data.get("segments", [])
+                predicted_segments = xy_cut_order_segments(predicted_segments, bbox)
+
+                for seg in predicted_segments:
                     if "segment_id" not in seg:
                         raise ValueError(
                             "Missing segment_id in {}".format(segment_json)
@@ -847,7 +1017,8 @@ def main():
                     optimizer_grouped_parameters.append(
                         {
                             "params": segment_params,
-                            "lr": self.args.learning_rate * 5.0,
+                            # nhân 1 nếu chạy funsd, nhân 0,5 nếu chạy cord
+                            "lr": self.args.learning_rate * 1.0,
                         }
                     )
 

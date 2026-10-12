@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -10,6 +11,10 @@ import numpy as np
 from datasets import ClassLabel, load_dataset, load_metric
 
 import transformers
+
+# V4-det: set CUDA/Python runtime flags before PyTorch initializes CUDA.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 from layoutlmft.data import DataCollatorForKeyValueExtraction
 from transformers import (
@@ -34,7 +39,170 @@ from layoutlmft.data.image_utils import RandomResizedCropAndInterpolationWithTwo
 from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
-import torch
+
+
+
+def xy_cut_order_segments(segments, word_bboxes, min_gap_ratio=0.012):
+    """Return predicted segments in recursive XY-cut reading order.
+
+    Segment membership is unchanged. Each segment's rectangle is the union of
+    its word-level bboxes (coordinates are normally normalized to 0..1000).
+    At each recursion, cut at the largest sufficiently wide whitespace gutter
+    in the x or y projection. Y cuts order top-to-bottom; X cuts order
+    left-to-right. If no safe gutter remains, use stable top-to-bottom,
+    left-to-right centroid order as a leaf fallback.
+
+    Args:
+        segments: list of segment dictionaries containing ``word_ids``.
+        word_bboxes: word-level bboxes aligned with the dataset ``words`` list.
+        min_gap_ratio: minimum gutter width relative to the full page span.
+
+    Returns:
+        A new list of the same segment dictionaries in reading order.
+    """
+    if not segments:
+        return []
+
+    records = []
+    unpositioned = []
+    for original_index, segment in enumerate(segments):
+        word_ids = segment.get("word_ids", [])
+        coords = []
+        for raw_wid in word_ids:
+            try:
+                wid = int(raw_wid)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= wid < len(word_bboxes):
+                raw_box = word_bboxes[wid]
+                if raw_box is None or len(raw_box) < 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = [float(v) for v in raw_box[:4]]
+                except (TypeError, ValueError):
+                    continue
+                if x1 < x0:
+                    x0, x1 = x1, x0
+                if y1 < y0:
+                    y0, y1 = y1, y0
+                coords.append((x0, y0, x1, y1))
+
+        if not coords:
+            unpositioned.append((original_index, segment))
+            continue
+
+        box = (
+            min(b[0] for b in coords),
+            min(b[1] for b in coords),
+            max(b[2] for b in coords),
+            max(b[3] for b in coords),
+        )
+        records.append({"index": original_index, "segment": segment, "box": box})
+
+    if not records:
+        return [seg for _, seg in sorted(unpositioned, key=lambda x: x[0])]
+
+    page_x_span = max(
+        max(r["box"][2] for r in records) - min(r["box"][0] for r in records), 1.0
+    )
+    page_y_span = max(
+        max(r["box"][3] for r in records) - min(r["box"][1] for r in records), 1.0
+    )
+    min_gap_x = max(1.0, page_x_span * float(min_gap_ratio))
+    min_gap_y = max(1.0, page_y_span * float(min_gap_ratio))
+    eps = 1e-6
+
+    def find_best_cut(items, axis):
+        if len(items) < 2:
+            return None
+        if axis == "x":
+            lo_i, hi_i = 0, 2
+            span, min_gap = page_x_span, min_gap_x
+        else:
+            lo_i, hi_i = 1, 3
+            span, min_gap = page_y_span, min_gap_y
+
+        intervals = sorted(
+            [(it["box"][lo_i], it["box"][hi_i], it["index"], it) for it in items],
+            key=lambda v: (v[0], v[1], v[2]),
+        )
+        merged = []
+        for lo, hi, _, _ in intervals:
+            if not merged or lo > merged[-1][1] + eps:
+                merged.append([lo, hi])
+            else:
+                merged[-1][1] = max(merged[-1][1], hi)
+
+        best = None
+        for k in range(len(merged) - 1):
+            left_edge = merged[k][1]
+            right_edge = merged[k + 1][0]
+            gap = right_edge - left_edge
+            if gap < min_gap:
+                continue
+
+            left_items = [it for it in items if it["box"][hi_i] <= left_edge + eps]
+            right_items = [it for it in items if it["box"][lo_i] >= right_edge - eps]
+            # Only make a cut when every item belongs wholly to exactly one side.
+            if not left_items or not right_items:
+                continue
+            if len(left_items) + len(right_items) != len(items):
+                continue
+
+            score = gap / span
+            # Prefer a horizontal separator (Y cut) on exact ties, giving
+            # top-to-bottom ordering before left-to-right ordering.
+            tie_priority = 1 if axis == "y" else 0
+            candidate = (score, tie_priority, left_items, right_items)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+
+        if best is None:
+            return None
+        return best[2], best[3], best[0]
+
+    def leaf_order(items):
+        return sorted(
+            items,
+            key=lambda it: (
+                0.5 * (it["box"][1] + it["box"][3]),
+                it["box"][0],
+                it["index"],
+            ),
+        )
+
+    def recurse(items, depth=0):
+        if len(items) <= 1:
+            return list(items)
+        # This guard is defensive; every successful cut must reduce both sides.
+        if depth > len(records):
+            return leaf_order(items)
+
+        x_cut = find_best_cut(items, "x")
+        y_cut = find_best_cut(items, "y")
+        chosen_axis = None
+        chosen = None
+        if x_cut is not None:
+            chosen_axis, chosen = "x", x_cut
+        if y_cut is not None:
+            if chosen is None or y_cut[2] > chosen[2] + eps:
+                chosen_axis, chosen = "y", y_cut
+            elif abs(y_cut[2] - chosen[2]) <= eps:
+                # Prefer Y for equal-width gutters.
+                chosen_axis, chosen = "y", y_cut
+
+        if chosen is None:
+            return leaf_order(items)
+        left_items, right_items, _ = chosen
+        return recurse(left_items, depth + 1) + recurse(right_items, depth + 1)
+
+    ordered_records = recurse(records)
+    ordered_segments = [record["segment"] for record in ordered_records]
+    # Preserve any empty/unpositioned segment deterministically at the end;
+    # word coverage validation below will still catch missing word assignments.
+    ordered_segments.extend(seg for _, seg in sorted(unpositioned, key=lambda x: x[0]))
+    return ordered_segments
+
 
 @dataclass
 class ModelArguments:
@@ -179,13 +347,30 @@ class DataTrainingArguments:
         default=False,
         metadata={"help": "Whether to return all the entity levels during evaluation or just the overall ones."},
     )
-    segment_level_layout: bool = field(default=True)
+    segment_level_layout: bool = field(
+        default=False,
+        metadata={
+            "help": "Legacy compatibility flag. For FUNSD, bbox granularity is controlled by layoutlmft/data/funsd.py; V5 always expects word-level boxes."
+        },
+    )
     visual_embed: bool = field(default=True)
     use_segment_head: bool = field(
         default=False,
         metadata={
             "help": "Use LayoutLMv3ForSegmentTokenClassification (segment-level pooling + "
             "inter-segment context head) instead of the vanilla per-token classification head."
+        },
+    )
+    segment_train_predictions_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory containing predicted segments for the FUNSD training split. V5 does NOT use gold form.id segments."
+        },
+    )
+    segment_eval_predictions_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory containing predicted segments for the FUNSD eval/test split."
         },
     )
     data_dir: Optional[str] = field(default=None)
@@ -210,6 +395,17 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    if data_args.use_segment_head:
+        if training_args.do_train and not data_args.segment_train_predictions_dir:
+            raise ValueError(
+                "V5 training requires --segment_train_predictions_dir because "
+                "gold FUNSD form.id segments are not used."
+            )
+        if (training_args.do_eval or training_args.do_predict) and not data_args.segment_eval_predictions_dir:
+            raise ValueError(
+                "V5 evaluation/prediction requires --segment_eval_predictions_dir."
+            )
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -246,7 +442,28 @@ def main():
         transformers.utils.logging.enable_explicit_format()
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Set seed before initializing model.
+    # ==================================================================
+    # V4-det: strict deterministic runtime.
+    # IMPORTANT: PYTHONHASHSEED must also be exported in the shell before
+    # Python starts; setting it here is too late to change hash randomization.
+    # ==================================================================
+    import random
+    random.seed(training_args.seed)
+    np.random.seed(training_args.seed)
+    torch.manual_seed(training_args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(training_args.seed)
+        torch.cuda.manual_seed_all(training_args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception as exc:
+        logger.warning("Could not enable deterministic algorithms: %s", exc)
     set_seed(training_args.seed)
 
     if data_args.dataset_name == 'funsd':
@@ -327,11 +544,10 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
     if getattr(data_args, "use_segment_head", False):
-        # NEW: segment-level pooling + inter-segment context head.
-        # See modeling_layoutlmv3_segment.py for the full design rationale.
+        # V5: predicted-segment contextual fusion in hidden space.
         from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
-    LayoutLMv3ForSegmentTokenClassification,
-)
+            LayoutLMv3ForSegmentTokenClassification,
+        )
         model = LayoutLMv3ForSegmentTokenClassification.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -372,7 +588,6 @@ def main():
             RandomResizedCropAndInterpolationWithTwoPic(
                 size=data_args.input_size, interpolation=data_args.train_interpolation),
         ])
-        import torch
         patch_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
@@ -381,7 +596,11 @@ def main():
         ])
 
     # Tokenize all texts and align the labels with them.
-    def tokenize_and_align_labels(examples, augmentation=False):
+    def tokenize_and_align_labels(
+        examples,
+        augmentation=False,
+        segment_predictions_dir=None,
+    ):
         tokenized_inputs = tokenizer(
             examples[text_column_name],
             padding=False,
@@ -489,18 +708,94 @@ def main():
             block_ids_orig = compute_block_ids(bbox)
             column_ids_orig = compute_column_ids(bbox, x_threshold=50)
 
-            # NEW: recover segment boundaries (giữ nguyên code cũ)
+            # -----------------------------------------------------------------
+            # V5 segment IDs
+            #
+            # IMPORTANT: both TRAIN and EVAL/TEST use predicted segments.
+            # There is intentionally NO gold form.id path here.
+            # The bbox remains word-level and segment membership is an
+            # independent input produced by the external segment predictor.
+            # -----------------------------------------------------------------
             word_seg_id = None
+
             if getattr(data_args, "use_segment_head", False):
-                word_seg_id = []
-                seg_counter = -1
-                prev_bbox_tuple = None
-                for wb in bbox:
-                    wb_tuple = tuple(wb)
-                    if wb_tuple != prev_bbox_tuple:
-                        seg_counter += 1
-                        prev_bbox_tuple = wb_tuple
-                    word_seg_id.append(seg_counter)
+                if not segment_predictions_dir:
+                    raise ValueError(
+                        "segment_predictions_dir is required when --use_segment_head "
+                        "is enabled. V5 never uses gold FUNSD form.id segments."
+                    )
+
+                image_path = examples["image_path"][org_batch_index]
+                stem = os.path.splitext(os.path.basename(image_path))[0]
+                segment_json = os.path.join(
+                    segment_predictions_dir,
+                    stem,
+                    "segments.json",
+                )
+
+                if not os.path.isfile(segment_json):
+                    raise FileNotFoundError(
+                        "Predicted segment file not found: {}".format(segment_json)
+                    )
+
+                with open(segment_json, "r", encoding="utf-8") as f:
+                    seg_data = json.load(f)
+
+                word_seg_id = [-1] * len(bbox)
+                raw_to_local = {}
+                next_local_sid = 0
+
+                # Recursive XY-cut is applied AFTER V4 has predicted segment
+                # membership. It changes only the order in which segment IDs
+                # are assigned; it does not merge/split or relabel membership.
+                predicted_segments = seg_data.get("segments", [])
+                predicted_segments = xy_cut_order_segments(predicted_segments, bbox)
+
+                for seg in predicted_segments:
+                    if "segment_id" not in seg:
+                        raise ValueError(
+                            "Missing segment_id in {}".format(segment_json)
+                        )
+
+                    raw_sid = int(seg["segment_id"])
+                    if raw_sid not in raw_to_local:
+                        raw_to_local[raw_sid] = next_local_sid
+                        next_local_sid += 1
+                    local_sid = raw_to_local[raw_sid]
+
+                    for wid in seg.get("word_ids", []):
+                        wid = int(wid)
+                        if not 0 <= wid < len(word_seg_id):
+                            raise ValueError(
+                                "Invalid word_id={} for {} ({} words)".format(
+                                    wid, segment_json, len(word_seg_id)
+                                )
+                            )
+                        if word_seg_id[wid] >= 0 and word_seg_id[wid] != local_sid:
+                            raise ValueError(
+                                "Word {} is assigned to multiple predicted segments in {}".format(
+                                    wid, segment_json
+                                )
+                            )
+                        word_seg_id[wid] = local_sid
+
+                missing = [
+                    i for i, sid in enumerate(word_seg_id) if sid < 0
+                ]
+                if missing:
+                    raise ValueError(
+                        "Predicted segmentation leaves {} words without segment ID "
+                        "for {}. First missing indices: {}".format(
+                            len(missing),
+                            stem,
+                            missing[:20],
+                        )
+                    )
+
+                if next_local_sid <= 0:
+                    raise ValueError(
+                        "No valid segments found in {}".format(segment_json)
+                    )
 
             previous_word_idx = None
             label_ids = []
@@ -583,7 +878,12 @@ def main():
             batched=True,
             remove_columns=remove_columns,
             num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
+            # Segment IDs come from external predicted segmentation; never use gold form.id.
+            load_from_cache_file=False if data_args.use_segment_head else not data_args.overwrite_cache,
+            fn_kwargs={
+                "segment_predictions_dir": data_args.segment_train_predictions_dir
+                if data_args.use_segment_head else None,
+            },
         )
         
 
@@ -599,7 +899,11 @@ def main():
             batched=True,
             remove_columns=remove_columns,
             num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
+            load_from_cache_file=False if data_args.use_segment_head else not data_args.overwrite_cache,
+            fn_kwargs={
+                "segment_predictions_dir": data_args.segment_eval_predictions_dir
+                if data_args.use_segment_head else None,
+            },
         )
 
     if training_args.do_predict:
@@ -613,7 +917,11 @@ def main():
             batched=True,
             remove_columns=remove_columns,
             num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache,
+            load_from_cache_file=False if data_args.use_segment_head else not data_args.overwrite_cache,
+            fn_kwargs={
+                "segment_predictions_dir": data_args.segment_eval_predictions_dir
+                if data_args.use_segment_head else None,
+            },
         )
 
     # Data collator
@@ -623,45 +931,6 @@ def main():
         padding=padding,
         max_length=512,
     )
-    # ====== KIỂM TRA BATCH DATA ======
-    # Tạo data collator và dataloader để kiểm tra
-    from torch.utils.data import DataLoader
-    temp_dataloader = DataLoader(
-        train_dataset,
-        batch_size=2,
-        collate_fn=data_collator,
-        shuffle=False
-    )
-    
-    # Lấy 1 batch
-    batch = next(iter(temp_dataloader))
-    
-    # Kiểm tra các keys trong batch
-    print("=" * 50)
-    print("KEYS IN BATCH:", batch.keys())
-    print("=" * 50)
-    
-    # Kiểm tra line_ids và block_ids có tồn tại không
-    if "line_ids" in batch:
-        print(f"✅ line_ids shape: {batch['line_ids'].shape}")
-        print(f"   line_ids sample: {batch['line_ids'][0][:10]}")  # 10 token đầu
-    else:
-        print("❌ line_ids NOT FOUND in batch!")
-    
-    if "block_ids" in batch:
-        print(f"✅ block_ids shape: {batch['block_ids'].shape}")
-        print(f"   block_ids sample: {batch['block_ids'][0][:10]}")
-    else:
-        print("❌ block_ids NOT FOUND in batch!")
-    
-    # Kiểm tra seg_id có bị xóa không
-    if "seg_id" in batch:
-        print(f"✅ seg_id shape: {batch['seg_id'].shape}")
-    else:
-        print("⚠️ seg_id NOT FOUND (có thể bị xóa trong data_collator)")
-    
-    print("=" * 50)
-    # ====== KẾT THÚC KIỂM TRA ======
 
     # Metrics
     metric = load_metric("seqeval")
@@ -698,23 +967,63 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
-    import torch
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
+    # ------------------------------------------------------------------
+    # V5 optimizer: avoid the previous 5e-4 classifier LR.
+    #
+    # Backbone + original token classifier use the normal fine-tuning LR.
+    # Only the new segment modules use a moderately larger LR.
+    # ------------------------------------------------------------------
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                backbone_params = []
+                classifier_params = []
+                segment_params = []
 
-                optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
-                ]
-                
+                for name, param in self.model.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    if name.startswith("layoutlmv3."):
+                        backbone_params.append(param)
+                    elif name.startswith("classifier.") or name.startswith("dropout."):
+                        classifier_params.append(param)
+                    elif (
+                        name.startswith("segment_context.")
+                        or name.startswith("segment_position_embedding.")
+                        or name.startswith("segment_fusion_gate.")
+                        or name.startswith("segment_residual.")
+                    ):
+                        segment_params.append(param)
+                    else:
+                        # Keep any future non-segment model parameter at the
+                        # normal fine-tuning LR rather than silently applying
+                        # the old 5e-4 LR.
+                        classifier_params.append(param)
+
+                optimizer_grouped_parameters = []
+
+                if backbone_params:
+                    optimizer_grouped_parameters.append(
+                        {"params": backbone_params, "lr": self.args.learning_rate}
+                    )
+                if classifier_params:
+                    optimizer_grouped_parameters.append(
+                        {
+                            "params": classifier_params,
+                            "lr": self.args.learning_rate,
+                        }
+                    )
+                if segment_params:
+                    optimizer_grouped_parameters.append(
+                        {
+                            "params": segment_params,
+                            # nhân 1 nếu chạy funsd, nhân 0,5 nếu chạy cord
+                            "lr": self.args.learning_rate * 1.0,
+                        }
+                    )
+
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    optimizer_grouped_parameters,
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )

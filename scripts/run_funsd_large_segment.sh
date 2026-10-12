@@ -1,44 +1,34 @@
 #!/bin/bash
 set -e
 
+
 cd /home/s24gbn1/Documents/httn/unilm/layoutlmv3
 export PYTHONPATH="/home/s24gbn1/Documents/httn/unilm/layoutlmv3:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=true 
 
-PYTHON_BIN="${PYTHON:-$(command -v python || true)}"
-if [ -z "$PYTHON_BIN" ]; then
-  PYTHON_BIN="$(command -v python3 || true)"
-fi
-if [ -z "$PYTHON_BIN" ]; then
-  echo "ERROR: No Python interpreter found. Activate the project env first: conda activate layoutlmv3"
-  exit 1
-fi
-
-echo "Using Python: $PYTHON_BIN"
-
-SEEDS=(42 123 1993)
-BASE_OUT_DIR="./logs/funsd-large-segment-token-0.03"
-
+SEEDS=(42 123 1993) 
+BASE_OUT_DIR="./logs/funsd-large-segment-v3-nssr"
+BROADCAST_MODE=${BROADCAST_MODE:-"additive"}
 for SEED in "${SEEDS[@]}"
 do
     OUT_DIR="${BASE_OUT_DIR}-seed${SEED}"
-    
     echo ""
     echo "============================================================"
-    echo "RUNNING FUNSD LARGE (SEGMENT HEAD) - SEED = ${SEED}"
+    echo "RUNNING FUNSD LARGE (SEGMENT HEAD + HIPOS) - SEED = ${SEED}"
     echo "============================================================"
-
-    "${PYTHON_BIN}" -m torch.distributed.run \
+    python -m torch.distributed.run \
       --nproc_per_node=1 \
-      --master_port=4398 \
+      --master_port=4400 \
       examples/run_funsd_cord.py \
       --dataset_name funsd \
       --do_train --do_eval \
       --use_segment_head \
-      --model_name_or_path models/layoutlmv3-large \
+      --segment_train_predictions_dir ./predicted_segment/funsd/train \
+      --segment_eval_predictions_dir ./predicted_segment/funsd/test \
+      --model_name_or_path /home/s24gbn1/Documents/phg/unilm/layoutlmv3/models/layoutlmv3-large \
       --output_dir "$OUT_DIR" \
-      --segment_level_layout 1 --visual_embed 1 --input_size 224 \
+      --segment_level_layout 0 --visual_embed 1 --input_size 224 \
       --max_steps 1000 --save_steps 1000 --evaluation_strategy steps --eval_steps 100 \
       --learning_rate 1e-5 \
       --warmup_ratio 0.1 \
@@ -56,7 +46,7 @@ echo "CALCULATING 3-SEED MEAN ± STD (FUNSD LARGE)"
 echo "============================================================"
 
 export BASE_OUT_DIR
-"${PYTHON_BIN}" - <<'PY'
+python - <<'PY'
 import os, json, numpy as np
 seeds = [42, 123, 1993]
 metrics = ["eval_accuracy", "eval_f1", "eval_precision", "eval_recall", "eval_loss"]

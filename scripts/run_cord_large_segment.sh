@@ -32,12 +32,20 @@ do
       --segment_level_layout 1 --visual_embed 1 --input_size 224 \
       --max_steps 1000 --save_steps -1 --evaluation_strategy steps --eval_steps 100 \
       --learning_rate 5e-5 \
+      --warmup_ratio 0.1 \
       --per_device_train_batch_size 2 \
       --gradient_accumulation_steps 32 \
       --dataloader_num_workers 4 \
       --report_to none \
       --seed "$SEED" \
-      --overwrite_output_dir --overwrite_cache
+      --overwrite_output_dir --overwrite_cache \
+      --use_hierarchical_position_encoding \
+      --max_line_position 80 \
+      --max_block_position 15 \
+      --use_column_encoding True \
+      --max_column_position 8 \
+      --use_intra_line_boundary True \
+      --lambda_bound_init 0.1
 done
 
 echo ""

@@ -32,6 +32,7 @@ do
       --segment_level_layout 1 --visual_embed 1 --input_size 224 \
       --max_steps 1000 --save_steps -1 --evaluation_strategy steps --eval_steps 100 \
       --learning_rate 5e-5 \
+      --warmup_ratio 0.1 \
       --per_device_train_batch_size 2 \
       --gradient_accumulation_steps 32 \
       --dataloader_num_workers 4 \
